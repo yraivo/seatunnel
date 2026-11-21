@@ -42,6 +42,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -69,6 +70,9 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
     private boolean isTableIdCaseSensitive;
 
     private Long checkpointIdToFinish;
+    private final Set<String> pendingReassignedSplits = ConcurrentHashMap.newKeySet();
+    private boolean awaitingReassignedCheckpoint;
+    private Long reassignedCheckpointIdToFinish;
     private final DataSourceDialect<C> dialect;
 
     SnapshotSplitAssigner(
@@ -200,7 +204,10 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
     @Override
     public void onCompletedSplits(List<SnapshotSplitWatermark> completedSplitWatermarks) {
         completedSplitWatermarks.forEach(
-                watermark -> this.splitCompletedOffsets.put(watermark.getSplitId(), watermark));
+                watermark -> {
+                    this.splitCompletedOffsets.put(watermark.getSplitId(), watermark);
+                    this.pendingReassignedSplits.remove(watermark.getSplitId());
+                });
         if (allSplitsCompleted()) {
             if (currentParallelism == 1) {
                 // A single-reader job completes immediately. Zeta disables checkpointing
@@ -227,9 +234,11 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
 
     @Override
     public void addSplits(Collection<SourceSplitBase> splits) {
+        boolean restoredCompletedSplit = false;
         for (SourceSplitBase split : splits) {
             SnapshotSplit snapshotSplit = split.asSnapshotSplit();
             if (restoreCompletedSnapshotSplit(snapshotSplit)) {
+                restoredCompletedSplit = true;
                 LOG.info(
                         "Restore completed snapshot split {} from checkpoint without replaying it",
                         snapshotSplit.splitId());
@@ -240,6 +249,26 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
             // failed
             assignedSplits.remove(snapshotSplit.splitId());
             splitCompletedOffsets.remove(snapshotSplit.splitId());
+            pendingReassignedSplits.add(snapshotSplit.splitId());
+            if ((assignerCompleted || checkpointIdToFinish != null) && currentParallelism > 1) {
+                awaitingReassignedCheckpoint = true;
+                reassignedCheckpointIdToFinish = null;
+            }
+            if (context != null) {
+                context.getAssignedSnapshotSplit().remove(snapshotSplit.splitId());
+                context.getSplitCompletedOffsets().remove(snapshotSplit.splitId());
+            }
+        }
+        if (restoredCompletedSplit && !assignerCompleted && allSplitsCompleted()) {
+            if (currentParallelism == 1) {
+                assignerCompleted = true;
+                LOG.info(
+                        "Snapshot split assigner received all splits completed at parallelism 1 after restore, snapshot split assigner is turn into completed status.");
+            } else {
+                LOG.info(
+                        "Snapshot split assigner received all splits completed at parallelism {} after restore, waiting for a complete checkpoint to mark the assigner completed.",
+                        currentParallelism);
+            }
         }
     }
 
@@ -264,6 +293,12 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
         if (checkpointIdToFinish == null && !assignerCompleted && allSplitsCompleted()) {
             checkpointIdToFinish = checkpointId;
         }
+        if (awaitingReassignedCheckpoint
+                && reassignedCheckpointIdToFinish == null
+                && pendingReassignedSplits.isEmpty()
+                && allSplitsCompleted()) {
+            reassignedCheckpointIdToFinish = checkpointId;
+        }
         return state;
     }
 
@@ -274,6 +309,14 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
         if (checkpointIdToFinish != null && !assignerCompleted && allSplitsCompleted()) {
             assignerCompleted = checkpointId >= checkpointIdToFinish;
             LOG.info("Snapshot split assigner is turn into completed status.");
+        }
+        if (awaitingReassignedCheckpoint
+                && reassignedCheckpointIdToFinish != null
+                && pendingReassignedSplits.isEmpty()
+                && allSplitsCompleted()
+                && checkpointId >= reassignedCheckpointIdToFinish) {
+            awaitingReassignedCheckpoint = false;
+            reassignedCheckpointIdToFinish = null;
         }
     }
 
@@ -288,6 +331,10 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
      */
     public boolean isCompleted() {
         return assignerCompleted;
+    }
+
+    boolean waitingForReassignedSplits() {
+        return !pendingReassignedSplits.isEmpty() || awaitingReassignedCheckpoint;
     }
 
     // -------------------------------------------------------------------------------------------
@@ -319,12 +366,17 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
                 || !assignedSplits.containsKey(snapshotSplit.splitId())) {
             return false;
         }
-        splitCompletedOffsets.putIfAbsent(
-                snapshotSplit.splitId(),
+        SnapshotSplitWatermark completedWatermark =
                 new SnapshotSplitWatermark(
                         snapshotSplit.splitId(),
                         snapshotSplit.getLowWatermark(),
-                        snapshotSplit.getHighWatermark()));
+                        snapshotSplit.getHighWatermark());
+        splitCompletedOffsets.putIfAbsent(snapshotSplit.splitId(), completedWatermark);
+        if (context != null) {
+            context.getSplitCompletedOffsets()
+                    .putIfAbsent(snapshotSplit.splitId(), completedWatermark);
+        }
+        pendingReassignedSplits.remove(snapshotSplit.splitId());
         return true;
     }
 
@@ -346,6 +398,7 @@ public class SnapshotSplitAssigner<C extends SourceConfig> implements SplitAssig
             if (tableIds.contains(assignedSplit.getTableId())) {
                 assignedSplits.remove(splitKey);
                 splitCompletedOffsets.remove(assignedSplit.splitId());
+                pendingReassignedSplits.remove(assignedSplit.splitId());
             }
         }
 

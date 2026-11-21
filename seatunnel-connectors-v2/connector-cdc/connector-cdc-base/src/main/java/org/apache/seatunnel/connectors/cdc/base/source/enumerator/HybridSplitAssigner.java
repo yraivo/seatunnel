@@ -101,7 +101,8 @@ public class HybridSplitAssigner<C extends SourceConfig> implements SplitAssigne
             // snapshot assigner still have remaining splits, assign split from it
             return snapshotSplitAssigner.getNext();
         }
-        if (!snapshotSplitAssigner.isCompleted()) {
+        if (!snapshotSplitAssigner.isCompleted()
+                || snapshotSplitAssigner.waitingForReassignedSplits()) {
             // incremental split is not ready by now
             return Optional.empty();
         }
@@ -119,6 +120,7 @@ public class HybridSplitAssigner<C extends SourceConfig> implements SplitAssigne
     @Override
     public boolean waitingForCompletedSplits() {
         return snapshotSplitAssigner.waitingForCompletedSplits()
+                || snapshotSplitAssigner.waitingForReassignedSplits()
                 || incrementalSplitAssigner.waitingForAssignedSplits();
     }
 
