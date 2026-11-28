@@ -4,13 +4,12 @@
 
 ## dev
 
-### CDC Connector：从 checkpoint/savepoint 恢复时拒绝残缺快照水位，不再静默回退 `startupOffset`
+### 文件连接器：ORC ZSTD 输出需要兼容的读取器
 
-- **行为变更：已完成快照分片的水位缺失或为 `null` 时，CDC 恢复以 `IllegalStateException` 快速失败**
-  - **影响范围**：`seatunnel-connectors-v2/connector-cdc/connector-cdc-base` 及其构建的 CDC 连接器。
-  - **描述**：CDC 作业从 checkpoint 或 savepoint 恢复并由快照阶段切入增量阶段时，`IncrementalSplitAssigner` 现在会校验每个已完成 `SnapshotSplit` 均具备非空 `SnapshotSplitWatermark` 且 `highWatermark` 非空（在 `exactly_once = false` 按最小快照位点选择起点时同时校验 `lowWatermark` 非空），并在 `addSplits` 回收已序列化的 `IncrementalSplit` 时校验 `CompletedSnapshotSplitInfo` 中的水位。此前，若所选水位偏移量为 `null`，`minOffset` 可能保持为 `null` 并静默回退到 `tableWatermarks` / `startupOffset`；而 `exactly_once = false` 或归还 `IncrementalSplit` 中高水位为 `null` 的情况则可能在后续 Reader 端抛出缺少表名和分片名的 `NullPointerException`。对于尾分片保存在 Reader `finishedUnackedSplits` 中的正常 checkpoint，现在会将重建水位同步至共享上下文并正常恢复。
-  - **影响**：缺少必要快照水位偏移量的残缺或损坏 checkpoint/savepoint 现在会在协调器侧立即抛出指明表名与分片 ID 的 `IllegalStateException`，而不再从回退位点继续读取或在 Reader 侧抛出裸 `NullPointerException`。原本可以正常恢复的 checkpoint 以及新启动作业继续按原行为恢复与运行。
-  - **迁移指南**：无需修改配置。如果升级后的 CDC 作业在恢复时触发该 `IllegalStateException`，请改从另一个完整的 checkpoint/savepoint 恢复，或重新提交新作业。(#13340)
+- **影响组件**：`connector-file-base` 及使用其 ORC 读写实现的文件连接器。
+- **变更说明**：`orc-core:nohive` 从 1.5.6 升级为 1.8.7，共享 ORC sink 配置规则接受 ZSTD，并将 ZSTD 映射为 ORC `CompressionKind.ZSTD`。现在可以读取 ZSTD 压缩的 ORC 文件，且 `compress_codec = "zstd"` 会实际生成 ZSTD 压缩文件，而不是映射为 NONE。此前，文件工厂会在配置校验阶段拒绝 ORC/ZSTD；绕过该规则的调用路径则可能静默生成未压缩文件。
+- **兼容性影响**：新生成的 ZSTD 文件要求下游读取器支持 ORC ZSTD。保留 ORC 文件版本 0.12 并不能让旧读取器支持该压缩格式。已有文件不会被重写，默认压缩仍为 NONE。
+- **迁移指南**：启用 ORC ZSTD 前先验证或升级下游读取器。分阶段升级期间，可显式保留双方均支持的 SNAPPY 或 ZLIB 等压缩格式。 (#13084)
 
 ### HBase sink：DELETE 行删除映射的数据
 
@@ -42,6 +41,14 @@
 
 增量读取并行度必须为一。Sink 仍支持表间并行，但每张源表只分配给一个 Flink Sink 子任务。
 连接器要求及共享物理目标表的限制见 [Flink 路由与故障恢复](../configuration/schema-evolution.md#flink-路由与故障恢复)。
+
+### CDC Connector：从 checkpoint/savepoint 恢复时拒绝残缺快照水位，不再静默回退 `startupOffset`
+
+- **行为变更：已完成快照分片的水位缺失或为 `null` 时，CDC 恢复以 `IllegalStateException` 快速失败**
+  - **影响范围**：`seatunnel-connectors-v2/connector-cdc/connector-cdc-base` 及其构建的 CDC 连接器。
+  - **描述**：CDC 作业从 checkpoint 或 savepoint 恢复并由快照阶段切入增量阶段时，`IncrementalSplitAssigner` 现在会校验每个已完成 `SnapshotSplit` 均具备非空 `SnapshotSplitWatermark` 且 `highWatermark` 非空（在 `exactly_once = false` 按最小快照位点选择起点时同时校验 `lowWatermark` 非空），并在 `addSplits` 回收已序列化的 `IncrementalSplit` 时校验 `CompletedSnapshotSplitInfo` 中的水位。此前，若所选水位偏移量为 `null`，`minOffset` 可能保持为 `null` 并静默回退到 `tableWatermarks` / `startupOffset`；而 `exactly_once = false` 或归还 `IncrementalSplit` 中高水位为 `null` 的情况则可能在后续 Reader 端抛出缺少表名和分片名的 `NullPointerException`。对于尾分片保存在 Reader `finishedUnackedSplits` 中的正常 checkpoint，现在会将重建水位同步至共享上下文并正常恢复。
+  - **影响**：缺少必要快照水位偏移量的残缺或损坏 checkpoint/savepoint 现在会在协调器侧立即抛出指明表名与分片 ID 的 `IllegalStateException`，而不再从回退位点继续读取或在 Reader 侧抛出裸 `NullPointerException`。原本可以正常恢复的 checkpoint 以及新启动作业继续按原行为恢复与运行。
+  - **迁移指南**：无需修改配置。如果升级后的 CDC 作业在恢复时触发该 `IllegalStateException`，请改从另一个完整的 checkpoint/savepoint 恢复，或重新提交新作业。(#13340)
 
 ### Http Sink：`array_mode = true` 时每行作为 JSON 对象发送
 
@@ -230,6 +237,12 @@ OptionRule rule = OptionRule.builder()
 - **行为变更**：使用 `decoding.plugin.name = "pgoutput"` 的流式作业会从源表结构中排除 PostgreSQL 发布未发布的列，包括 PostgreSQL 18 之前的生成列、虚拟生成列以及发布列列表中省略的列。仅快照作业和其他解码插件不受影响。
 - **影响**：下次启动或恢复作业时，快照和自动创建的目标表将不再包含未发布的非主键列。依赖这些列的现有目标表和下游使用方可能需要调整表结构或字段映射；此前流式更新可能将这些列写为 NULL，或因表结构不匹配而失败。如果必需的主键未发布（包括仅发布 INSERT 的发布），作业现在会在启动时失败，而不是保留该列并在流式同步中输出 NULL 主键。
 - **迁移指南**：升级前检查发布配置及下游表结构。在 PostgreSQL 18 中，设置 `publish_generated_columns = stored` 的发布可以保留存储生成列；虚拟生成列仍不会发布。使用发布列列表时，请加入所有必需主键列（包括 `table-names-config.primaryKeys` 配置的主键）和其他必需列。发布 UPDATE/DELETE 时，PostgreSQL 还要求包含副本标识列。请调整目标表结构和下游映射，移除其他未发布的列；没有显式列列表的发布仍遵循生成列规则。
+
+### PostgreSQL CDC：新增用户自定义枚举和范围类型列
+
+- **行为变更**：使用 `decoding.plugin.name = "pgoutput"` 并开启 Schema 变更时，用户自定义枚举、范围或多范围类型的新增列，类型名改为 `format_type(oid, NULL)` 的结果：需要时加引号，类型所在 schema 不在源连接 `search_path` 中时带上 schema。此前下游收到的是不带引号和 schema 的 `pg_type.typname`。
+- **影响**：PostgreSQL JDBC Sink 现在执行的是类似 `ALTER TABLE ... ADD c inv.mood` 的语句，而不是 `ADD c mood`。如果 Sink 此前把不带 schema 的类型名解析为另一个 schema 中的同名类型，现在会在 Sink 端失败。如果无法从源端 `pg_type` 读取列类型名，作业会以 `POSTGRES-05` 失败。
+- **迁移指南**：升级前，请在 Sink 数据库中按源端相同的 schema 创建新增列用到的用户自定义类型。
 
 ### Markdown File Source 的 `child_ids` 数组
 
